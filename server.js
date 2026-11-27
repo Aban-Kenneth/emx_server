@@ -19,6 +19,8 @@ let sweepers = [];
 let settings = { jingle_after_songs: 10, sweeper_after_songs: 3, sweeper_after_minutes: 15 };
 let songsPlayed = 0;
 let lastSweeperTime = Date.now();
+let isLive = false;
+let liveZenoUrl = '';
 
 async function loadFromSupabase() {
   const { data: playlist } = await supabase.from('auto_playlist').select('position, songs(*)').order('position');
@@ -29,12 +31,22 @@ async function loadFromSupabase() {
   if (playlist) currentPlaylist = playlist.map(p => p.songs);
   if (j) jingles = j;
   if (s) sweepers = s;
-  if (st) settings = st;
-  console.log(`Loaded: ${currentPlaylist.length} songs, ${jingles.length} jingles, Jingle every ${settings.jingle_after_songs}`);
+  if (st) {
+    settings = st;
+    // Check if presenter is LIVE on Zeno
+    if (st.live_mode === true || st.is_live === true) {
+      isLive = true;
+      liveZenoUrl = st.live_zeno_url || st.zeno_url || '';
+    } else {
+      isLive = false;
+    }
+  }
+  console.log(`Loaded: ${currentPlaylist.length} songs, ${jingles.length} jingles, Live: ${isLive}`);
 }
 
 // Convert Drive link to direct download link
 function driveToDirect(url) {
+  if (!url) return url;
   const match = url.match(/\/d\/([^\/]+)/);
   if (match) return `https://drive.google.com/uc?export=download&id=${match[1]}`;
   return url;
@@ -43,17 +55,26 @@ function driveToDirect(url) {
 // The DJ Loop - Plays forever
 async function djLoop() {
   await loadFromSupabase();
+
+  // If presenter is LIVE on Zeno, pause DJ and wait
+  if (isLive) {
+    console.log('🔴 LIVE on Zeno - DJ paused, waiting 10s...');
+    setTimeout(djLoop, 10000);
+    return;
+  }
+
   if (currentPlaylist.length === 0) {
     console.log('No songs, waiting 5s...');
     setTimeout(djLoop, 5000);
     return;
   }
 
-  // Shuffle or in order? In order for now
   for (let i = 0; i < currentPlaylist.length; i++) {
+    // Check live again before each song
+    await loadFromSupabase();
+    if (isLive) break;
+
     const song = currentPlaylist[i];
-    
-    // Decide: Jingle or Sweeper?
     let trackToPlay = song;
     let isJingle = false;
     songsPlayed++;
@@ -65,14 +86,13 @@ async function djLoop() {
     } else if (sweepers.length > 0) {
       const minsSinceSweeper = (Date.now() - lastSweeperTime) / 60000;
       if (songsPlayed % settings.sweeper_after_songs === 0 || minsSinceSweeper >= settings.sweeper_after_minutes) {
-        // Play sweeper BEFORE song, then song
         await streamOneFile(driveToDirect(sweepers[0].drive_url), `SWEEPER: ${sweepers[0].name}`);
         lastSweeperTime = Date.now();
       }
     }
 
     if (!isJingle) console.log(`▶️ NOW PLAYING: ${song.title} - ${song.artist}`);
-    await streamOneFile(driveToDirect(trackToPlay.drive_url || trackToPlay.drive_url), trackToPlay.title || trackToPlay.name);
+    await streamOneFile(driveToDirect(trackToPlay.drive_url), trackToPlay.title || trackToPlay.name);
   }
   // Loop forever
   djLoop();
@@ -102,7 +122,7 @@ function streamOneFile(url, label) {
       });
 
       ffmpeg.on('close', () => resolve());
-      ffmpeg.stderr.on('data', () => {}); // ignore logs
+      ffmpeg.stderr.on('data', () => {});
     } catch (e) {
       console.log('Error playing', label, e.message);
       resolve();
@@ -125,6 +145,17 @@ app.get('/stream', (req, res) => {
   req.on('close', () => {
     listeners = listeners.filter(r => r !== res);
     console.log(`Listener left. Total: ${listeners.length}`);
+  });
+});
+
+// Flutter apps check this to know if LIVE or AUTO
+app.get('/status', async (req, res) => {
+  await loadFromSupabase();
+  res.json({
+    live: isLive,
+    zeno_url: liveZenoUrl,
+    listeners: listeners.length,
+    songs_played: songsPlayed
   });
 });
 
